@@ -27,12 +27,21 @@ object BrowserLoginHelper {
 
     private const val PROFILE_NAME = "login-profile"
 
-    fun findLoginBrowser(): LoginBrowser? = when {
-        Platform.isWindows -> findWindowsBrowser()
-        Platform.isLinux -> findLinuxBrowser()
-        Platform.isMac -> File("/Applications/Firefox.app/Contents/MacOS/firefox").takeIf { it.exists() }
-            ?.let { LoginBrowser(BrowserKind.FIREFOX, it, "Firefox", defaultProfileDir()) }
-        else -> null
+    fun findLoginBrowser(): LoginBrowser? = findAllLoginBrowsers().firstOrNull()
+
+    /**
+     * Every supported browser installed here, in preference order. The login screen shows this
+     * list so someone with Edge and Chrome can pick which one opens, instead of always getting
+     * whichever happens to be first on disk.
+     */
+    fun findAllLoginBrowsers(): List<LoginBrowser> = when {
+        Platform.isWindows -> findWindowsBrowsers()
+        Platform.isLinux -> findLinuxBrowsers()
+        Platform.isMac -> listOfNotNull(
+            File("/Applications/Firefox.app/Contents/MacOS/firefox").takeIf { it.exists() }
+                ?.let { LoginBrowser(BrowserKind.FIREFOX, it, "Firefox", defaultProfileDir()) }
+        )
+        else -> emptyList()
     }
 
     /** The browsers looked for on this OS, for the "no browser found" message. */
@@ -42,7 +51,7 @@ object BrowserLoginHelper {
         else -> "Firefox"
     }
 
-    private fun findWindowsBrowser(): LoginBrowser? {
+    private fun findWindowsBrowsers(): List<LoginBrowser> {
         val localAppData = System.getenv("LOCALAPPDATA") ?: ""
         val programFiles = System.getenv("ProgramFiles") ?: "C:\\Program Files"
         val programFilesX86 = System.getenv("ProgramFiles(x86)") ?: "C:\\Program Files (x86)"
@@ -60,19 +69,23 @@ object BrowserLoginHelper {
             Triple(BrowserKind.FIREFOX, "Firefox", "$programFiles\\Mozilla Firefox\\firefox.exe"),
             Triple(BrowserKind.FIREFOX, "Firefox", "$programFilesX86\\Mozilla Firefox\\firefox.exe"),
         )
-        return candidates.firstOrNull { File(it.third).exists() }
-            ?.let { (kind, name, path) -> LoginBrowser(kind, File(path), name, defaultProfileDir()) }
+        return candidates
+            .filter { File(it.third).exists() }
+            .map { (kind, name, path) -> LoginBrowser(kind, File(path), name, defaultProfileDir()) }
+            .distinctBy { it.name }
     }
 
-    private fun findLinuxBrowser(): LoginBrowser? {
+    private fun findLinuxBrowsers(): List<LoginBrowser> {
         val home = System.getProperty("user.home")
         // Snap confinement forbids hidden dirs in $HOME and anything outside it, so a snap
         // browser gets its profile in its own common dir, which Wave Music (same user) can read.
         fun snapProfile(snap: String) = File(home, "snap/$snap/common/wavemusic-$PROFILE_NAME")
 
+        val found = mutableListOf<LoginBrowser>()
+
         // Ubuntu's /usr/bin/firefox is a wrapper that runs the snap: go straight to the snap.
         File("/snap/bin/firefox").takeIf { it.exists() }?.let {
-            return LoginBrowser(BrowserKind.FIREFOX, it, "Firefox", snapProfile("firefox"))
+            found += LoginBrowser(BrowserKind.FIREFOX, it, "Firefox", snapProfile("firefox"))
         }
         val candidates = listOf(
             Triple(BrowserKind.FIREFOX, "Firefox", "firefox"),
@@ -97,16 +110,17 @@ object BrowserLoginHelper {
             }
             if (snapName != null) exe = File("/snap/bin/$snapName")
             val profile = if (snapName != null) snapProfile(snapName) else defaultProfileDir()
-            return LoginBrowser(kind, exe, name, profile)
+            found += LoginBrowser(kind, exe, name, profile)
         }
         // Flatpak browsers (SteamOS, Silverblue) see only their own ~/.var/app/<id>, so the profile
         // goes there. The exported launcher runs `flatpak run` and stays up while the browser does.
         for ((kind, name, appId) in flatpakBrowsers) {
             val exe = listOf(File(home, ".local/share/flatpak/exports/bin/$appId"), File("/var/lib/flatpak/exports/bin/$appId"))
                 .firstOrNull { it.isFile } ?: continue
-            return LoginBrowser(kind, exe, name, flatpakProfile(appId))
+            found += LoginBrowser(kind, exe, name, flatpakProfile(appId))
         }
-        return null
+        // /snap/bin/firefox above wins over the /usr/bin/firefox wrapper for the same browser.
+        return found.distinctBy { it.name }
     }
 
     private val flatpakBrowsers = listOf(
@@ -247,9 +261,10 @@ object BrowserLoginHelper {
      * 3. Read cookies from the now-unlocked cookie DB
      */
     suspend fun loginWithBrowser(
+        chosenBrowser: LoginBrowser? = null,
         onStatus: (String) -> Unit
     ): CookieExtractResult = withContext(Dispatchers.IO) {
-        val browser = findLoginBrowser()
+        val browser = chosenBrowser ?: findLoginBrowser()
             ?: return@withContext CookieExtractResult.Error(
                 "No browser found (Wave Music looks for $supportedBrowserNames). " +
                     "You can paste a cookie under Advanced instead."

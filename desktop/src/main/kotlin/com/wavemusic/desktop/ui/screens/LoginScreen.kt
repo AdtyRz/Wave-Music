@@ -1,5 +1,6 @@
 package com.wavemusic.desktop.ui.screens
 
+import com.wavemusic.desktop.ui.components.BrowserChooser
 import com.wavemusic.desktop.ui.components.Tip
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -38,7 +39,9 @@ fun LoginScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var statusMessage by remember { mutableStateOf("") }
 
-    val browser = remember { BrowserLoginHelper.findLoginBrowser() }
+    val browsers = remember { BrowserLoginHelper.findAllLoginBrowsers() }
+    var selectedBrowser by remember { mutableStateOf(browsers.firstOrNull()) }
+    val browser = selectedBrowser
     val hasBrowser = browser != null
 
     fun handleCookieResult(result: CookieExtractResult) {
@@ -74,7 +77,7 @@ fun LoginScreen(
         statusMessage = "Opening browser..."
 
         scope.launch {
-            val result = BrowserLoginHelper.loginWithBrowser { status ->
+            val result = BrowserLoginHelper.loginWithBrowser(selectedBrowser) { status ->
                 statusMessage = status
             }
             handleCookieResult(result)
@@ -168,6 +171,11 @@ fun LoginScreen(
                                     )
                                 }
                             }
+                            BrowserChooser(
+                                browsers = browsers,
+                                selected = selectedBrowser,
+                                onSelect = { selectedBrowser = it },
+                            )
                         } else {
                             Text(
                                 "No supported browser found. Wave Music looks for " +
