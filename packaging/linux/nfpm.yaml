@@ -1,0 +1,45 @@
+# Linux .deb / .rpm for WaveMusic, built from `./gradlew :desktop:createDistributable` output.
+#
+# nfpm rather than Compose's packageDeb/packageRpm because those cannot declare dependencies,
+# and WaveMusic needs the distro's VLC (it is not bundled on Linux). Run from the repo root:
+#   WAVEMUSIC_VERSION=2.14.0 nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/
+#   WAVEMUSIC_VERSION=2.14.0 nfpm package -f packaging/linux/nfpm.yaml -p rpm -t dist/
+name: wvusic
+arch: amd64
+platform: linux
+version: ${WAVEMUSIC_VERSION}
+section: sound
+priority: optional
+maintainer: AdtyRz <noreply@github.com>
+description: |
+  Wave Music (Wvusic), a YouTube Music player for your desktop.
+  Library sync, downloads, lyrics, Discord and Last.fm, Listen Together.
+homepage: https://github.com/AdtyRz/Wave-Music
+license: GPL-3.0
+
+overrides:
+  deb:
+    depends:
+      - libvlc5
+      - vlc-plugin-base
+    recommends:
+      - ffmpeg
+      - libnotify-bin
+  rpm:
+    depends:
+      - vlc
+    recommends:
+      - (ffmpeg or ffmpeg-free)
+      - libnotify
+
+contents:
+  - src: desktop/build/compose/binaries/main/app/Wvusic/
+    dst: /opt/wvusic
+    type: tree
+  - src: /opt/wvusic/bin/Wvusic
+    dst: /usr/bin/wvusic
+    type: symlink
+  - src: packaging/linux/wvusic.desktop
+    dst: /usr/share/applications/wvusic.desktop
+  - src: desktop/src/main/resources/icon.png
+    dst: /usr/share/icons/hicolor/512x512/apps/wvusic.png

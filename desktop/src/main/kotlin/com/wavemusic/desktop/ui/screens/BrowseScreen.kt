@@ -1,0 +1,139 @@
+package com.wavemusic.desktop.ui.screens
+
+import com.wavemusic.desktop.ui.theme.WaveMusicTokens
+import com.wavemusic.desktop.ui.components.DetailTopBar
+import com.wavemusic.desktop.ui.components.ScreenTitle
+import com.wavemusic.desktop.ui.components.MediaTile
+import com.wavemusic.desktop.ui.components.squareCropFriendly
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil3.compose.AsyncImage
+import com.metrolist.innertube.YouTube
+import com.metrolist.innertube.models.*
+import com.metrolist.innertube.pages.BrowseResult
+import com.wavemusic.desktop.playback.DesktopPlayer
+import com.wavemusic.desktop.settings.PreferencesManager
+import com.wavemusic.desktop.ui.components.ScrollableRow
+import kotlinx.coroutines.launch
+import timber.log.Timber
+
+/**
+ * Generic browse screen for InnerTube browse endpoints:
+ * mood/genre pages, charts (FEmusic_charts), and other browseId destinations.
+ */
+@Composable
+fun BrowseScreen(
+    browseId: String,
+    params: String?,
+    title: String,
+    player: DesktopPlayer,
+    onBack: () -> Unit,
+    onAlbumClick: (String) -> Unit = {},
+    onArtistClick: (String) -> Unit = {},
+    onPlaylistClick: (String) -> Unit = {}
+) {
+    val scope = rememberCoroutineScope()
+    // rememberSaveable: App keeps this screen's state while it is under another on the back
+    // stack, so going back restores the page and scroll position instead of refetching.
+    var result by rememberSaveable { mutableStateOf<BrowseResult?>(null) }
+    var isLoading by rememberSaveable { mutableStateOf(true) }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+    val prefs by PreferencesManager.preferences.collectAsState()
+
+    LaunchedEffect(browseId, params) {
+        if (result != null) return@LaunchedEffect // restored from the back stack
+        try {
+            isLoading = true
+            error = null
+            YouTube.browse(browseId, params).onSuccess { browseResult ->
+                result = browseResult.filterExplicit(prefs.hideExplicit)
+                isLoading = false
+            }.onFailure { e ->
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Timber.e("Browse error ($browseId): ${e.message?.take(200)}")
+                error = friendlyErrorMessage(e, "Failed to load content")
+                isLoading = false
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = friendlyErrorMessage(e, "Failed to load content")
+            isLoading = false
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        DetailTopBar(onBack, result?.title ?: title, collapsed = false)
+        ScreenTitle(result?.title ?: title, Modifier.padding(horizontal = WaveMusicTokens.contentPadding))
+        Spacer(Modifier.height(12.dp))
+
+        Box(modifier = Modifier.fillMaxSize().padding(horizontal = WaveMusicTokens.contentPadding)) {
+            when {
+                isLoading -> {
+                    CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                }
+                error != null -> {
+                    Column(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(error ?: "", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                else -> {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                        items(result?.items.orEmpty()) { section ->
+                            if (section.items.isNotEmpty()) {
+                                Column {
+                                    section.title?.let { sectionTitle ->
+                                        Text(
+                                            sectionTitle,
+                                            style = MaterialTheme.typography.titleLarge,
+                                            modifier = Modifier.padding(bottom = 12.dp)
+                                        )
+                                    }
+                                    ScrollableRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        items(section.items) { item ->
+                                            MediaTile(
+                                                item = item,
+                                                player = player,
+                                                onClick = {
+                                                    when (item) {
+                                                        is SongItem -> scope.launch {
+                                                            item.toSongInfo()?.let { player.playSong(it) }
+                                                        }
+                                                        is AlbumItem -> onAlbumClick(item.browseId)
+                                                        is ArtistItem -> onArtistClick(item.id)
+                                                        is PlaylistItem -> onPlaylistClick(item.id)
+                                                        else -> {}
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        item { Spacer(Modifier.height(16.dp)) }
+                    }
+                }
+            }
+        }
+    }
+}
+

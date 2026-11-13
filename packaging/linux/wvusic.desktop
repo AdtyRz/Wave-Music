@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Wvusic
+GenericName=Music Player
+Comment=YouTube Music player for your desktop
+Exec=wvusic
+Icon=wvusic
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;youtube;player;
+# AWT names the X11 window class after the main class, so the dock groups the window with this launcher.
+StartupWMClass=com-wavemusic-desktop-MainKt

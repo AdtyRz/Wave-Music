@@ -1,0 +1,705 @@
+package com.wavemusic.desktop.ui
+
+import com.wavemusic.desktop.ui.components.Tip
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.semantics.Role
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
+import coil3.compose.AsyncImage
+import com.wavemusic.desktop.auth.AuthManager
+import com.wavemusic.desktop.media.MediaKeyHandler
+import com.wavemusic.desktop.playback.DesktopPlayer
+import com.wavemusic.desktop.settings.PreferencesManager
+import com.wavemusic.desktop.ui.screens.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import com.wavemusic.desktop.ui.components.AutoScroll
+import com.wavemusic.desktop.ui.components.LyricsPanel
+import com.wavemusic.desktop.ui.components.MiniPlayer
+import com.wavemusic.desktop.ui.components.select
+import com.wavemusic.desktop.ui.theme.rememberArtTint
+import com.wavemusic.desktop.ui.components.UpdateBadge
+import com.wavemusic.desktop.ui.theme.LocalWaveMusicExtras
+import com.wavemusic.desktop.ui.theme.WaveMusicTokens
+
+enum class Screen(val title: String, val icon: ImageVector, val selectedIcon: ImageVector) {
+    Home("Home", Icons.Outlined.Home, Icons.Filled.Home),
+    Explore("Explore", Icons.Outlined.Explore, Icons.Filled.Explore),
+    Search("Search", Icons.Outlined.Search, Icons.Filled.Search),
+    Library("Library", Icons.Outlined.LibraryMusic, Icons.Filled.LibraryMusic),
+    Settings("Settings", Icons.Outlined.Settings, Icons.Filled.Settings)
+}
+
+sealed class AppScreen {
+    data object Main : AppScreen()
+    data object Login : AppScreen()
+    data object Onboarding : AppScreen()
+}
+
+// Navigation destinations for detail screens
+sealed class DetailScreen {
+    data class Album(val browseId: String) : DetailScreen()
+    data class Artist(val browseId: String) : DetailScreen()
+    data class Playlist(val playlistId: String) : DetailScreen()
+    data class LocalPlaylist(val playlistId: String) : DetailScreen()
+    data class AutoPlaylist(val type: AutoPlaylistType) : DetailScreen()
+    data class Podcast(val podcastId: String) : DetailScreen()
+    data class Browse(val browseId: String, val params: String?, val title: String) : DetailScreen()
+    data class ArtistItems(val browseId: String, val params: String?, val title: String) : DetailScreen()
+    data object ListenTogether : DetailScreen()
+    data object Recognition : DetailScreen()
+    data object Equalizer : DetailScreen()
+    data object Stats : DetailScreen()
+}
+
+enum class AutoPlaylistType(val title: String) {
+    LIKED("Liked Songs"),
+    DOWNLOADED("Downloaded"),
+    MOST_PLAYED("Most Played")
+}
+
+/**
+ * The app's keyboard shortcuts, read by the window's own key handlers in Main.kt. Window level
+ * sees every key whether or not a composable has focus; App installs the handlers while the main
+ * screen is up and removes them when it leaves.
+ */
+object AppShortcuts {
+    var preview: (KeyEvent) -> Boolean = { false }
+    var bubble: (KeyEvent) -> Boolean = { false }
+    fun reset() { preview = { false }; bubble = { false } }
+}
+
+@Composable
+fun App(player: DesktopPlayer) {
+    // Read once, not as state: preferences are already loaded by the time App composes, and
+    // collecting the flow here would yank a half-finished wizard away the moment it sets the flag.
+    var currentAppScreen by remember {
+        mutableStateOf<AppScreen>(
+            if (PreferencesManager.preferences.value.onboardingCompleted) AppScreen.Main
+            else AppScreen.Onboarding
+        )
+    }
+    var currentScreen by remember { mutableStateOf(Screen.Home) }
+    var showQueueScreen by remember { mutableStateOf(false) }
+    var showLyricsPanel by remember { mutableStateOf(false) }
+    var showCommandPalette by remember { mutableStateOf(false) }
+    // Set when something navigates to Settings to do one specific thing; Settings clears it once
+    // it has scrolled, so returning there later opens at the top as normal.
+    var settingsScrollTarget by remember { mutableStateOf<String?>(null) }
+    val authState by AuthManager.authState.collectAsState()
+    // Only the error field, not the whole state: position ticks every 200 ms and would
+    // recompose the entire app shell if collected wholesale.
+    val playbackError by remember { player.state.map { it.error } }.collectAsState(null)
+    val scope = rememberCoroutineScope()
+
+    // Navigation stack for detail screens
+    val detailStack = remember { mutableStateListOf<DetailScreen>() }
+
+    // Keeps each screen's saveable state (loaded page, scroll position, filters) while another
+    // screen covers it, so Back and tab switches restore instead of refetching from the top.
+    // Detail entries are keyed by depth too, so the same album twice in the stack stays separate.
+    val stateHolder = rememberSaveableStateHolder()
+    val detailKeys = detailStack.mapIndexed { i, d -> "detail:$i:$d" }
+    val liveDetailKeys = remember { mutableSetOf<String>() }
+    SideEffect {
+        // An entry popped off the stack is gone for good; drop its state rather than leak it.
+        (liveDetailKeys - detailKeys.toSet()).forEach(stateHolder::removeState)
+        liveDetailKeys.clear()
+        liveDetailKeys.addAll(detailKeys)
+    }
+
+    fun navigateToAlbum(browseId: String) {
+        detailStack.add(DetailScreen.Album(browseId))
+    }
+
+    fun navigateToArtist(browseId: String) {
+        detailStack.add(DetailScreen.Artist(browseId))
+    }
+
+    fun navigateToPlaylist(playlistId: String) {
+        detailStack.add(DetailScreen.Playlist(playlistId))
+    }
+
+    fun navigateToPodcast(podcastId: String) {
+        detailStack.add(DetailScreen.Podcast(podcastId))
+    }
+
+    fun navigateBack() {
+        if (detailStack.isNotEmpty()) {
+            detailStack.removeAt(detailStack.lastIndex)
+        }
+    }
+
+    when (currentAppScreen) {
+        AppScreen.Onboarding -> {
+            OnboardingScreen(
+                onFinish = {
+                    currentAppScreen = AppScreen.Main
+                    currentScreen = Screen.Home
+                }
+            )
+        }
+
+        AppScreen.Login -> {
+            LoginScreen(
+                onBack = { currentAppScreen = AppScreen.Main },
+                onLoginSuccess = {
+                    currentAppScreen = AppScreen.Main
+                    currentScreen = Screen.Home
+                }
+            )
+        }
+
+        AppScreen.Main -> {
+            // Shortcuts are installed on the window (see AppShortcuts), not on this Row: a
+            // node's handler only sees keys while something inside it has focus, and a click on
+            // a list row or empty space leaves nothing focused.
+            DisposableEffect(Unit) {
+                // TUNNEL phase (before the focused node): Escape + Ctrl shortcuts only.
+                // These use modifier keys so they don't conflict with text input.
+                AppShortcuts.preview = preview@{ event ->
+                    if (event.type != KeyEventType.KeyDown) return@preview false
+                    when {
+                        event.key == Key.Escape -> when {
+                            AutoScroll.isActive -> { AutoScroll.stop(); true }
+                            showCommandPalette -> { showCommandPalette = false; true }
+                            showQueueScreen -> { showQueueScreen = false; true }
+                            showLyricsPanel -> { showLyricsPanel = false; true }
+                            detailStack.isNotEmpty() -> { navigateBack(); true }
+                            else -> false
+                        }
+                        event.isCtrlPressed -> when (event.key) {
+                            // Navigation shortcuts stay global.
+                            Key.F -> { currentScreen = Screen.Search; detailStack.clear(); true }
+                            Key.Q -> { showQueueScreen = !showQueueScreen; if (showQueueScreen) showLyricsPanel = false; true }
+                            Key.L -> { showLyricsPanel = !showLyricsPanel; if (showLyricsPanel) showQueueScreen = false; true }
+                            Key.K -> { showCommandPalette = !showCommandPalette; true }
+                            // Player shortcuts must not steal Ctrl+Left/Right (word jump),
+                            // Ctrl+S/P/R etc. while the user is typing in a text field.
+                            // Preview runs before the field sees the event, so check explicitly.
+                            Key.P -> if (MediaKeyHandler.textInputActive) false
+                                else { player.togglePlayPause(); true }
+                            Key.S -> if (MediaKeyHandler.textInputActive) false
+                                else { player.toggleShuffle(); true }
+                            Key.R -> if (MediaKeyHandler.textInputActive) false
+                                else { player.toggleRepeat(); true }
+                            Key.DirectionRight -> if (MediaKeyHandler.textInputActive) false
+                                else { scope.launch { player.playNext() }; true }
+                            Key.DirectionLeft -> if (MediaKeyHandler.textInputActive) false
+                                else { scope.launch { player.playPrevious() }; true }
+                            Key.DirectionUp -> if (MediaKeyHandler.textInputActive) false else {
+                                val v = PreferencesManager.preferences.value.volume
+                                val nv = (v + 0.05f).coerceAtMost(1f)
+                                PreferencesManager.setVolume(nv); player.setVolume(nv); true
+                            }
+                            Key.DirectionDown -> if (MediaKeyHandler.textInputActive) false else {
+                                val v = PreferencesManager.preferences.value.volume
+                                val nv = (v - 0.05f).coerceAtLeast(0f)
+                                PreferencesManager.setVolume(nv); player.setVolume(nv); true
+                            }
+                            else -> false
+                        }
+                        else -> false
+                    }
+                }
+                // BUBBLE phase (after the focused node): bare keys (Space, M, arrows).
+                // Text fields consume these first (typing characters / moving cursor).
+                // Only reaches here if NO text field handled the event.
+                AppShortcuts.bubble = bubble@{ event ->
+                    if (event.type != KeyEventType.KeyDown) return@bubble false
+                    if (event.isCtrlPressed) return@bubble false // already handled in preview
+                    if (MediaKeyHandler.textInputActive) return@bubble false
+                    when (event.key) {
+                        Key.Spacebar -> { player.togglePlayPause(); true }
+                        Key.M -> { MediaKeyHandler.toggleMute(player); true }
+                        Key.DirectionRight -> {
+                            val pos = player.state.value.position
+                            val dur = player.state.value.duration
+                            player.seekTo((pos + 10000).coerceAtMost(dur)); true
+                        }
+                        Key.DirectionLeft -> {
+                            val pos = player.state.value.position
+                            player.seekTo((pos - 10000).coerceAtLeast(0)); true
+                        }
+                        else -> false
+                    }
+                }
+                onDispose { AppShortcuts.reset() }
+            }
+
+            Row(modifier = Modifier.fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+            ) {
+                // Side navigation rail
+                NavigationRail(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(WaveMusicTokens.navigationRailWidth),
+                    containerColor = LocalWaveMusicExtras.current.railColor,
+                    header = {
+                        Spacer(Modifier.height(8.dp))
+                        AccountButton(
+                            isLoggedIn = authState.isLoggedIn,
+                            accountName = authState.accountInfo?.name,
+                            avatarUrl = authState.accountInfo?.avatarUrl,
+                            onClick = {
+                                if (authState.isLoggedIn) {
+                                    currentScreen = Screen.Settings
+                                    detailStack.clear()
+                                } else {
+                                    currentAppScreen = AppScreen.Login
+                                }
+                            }
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
+                ) {
+                    /**
+                     * The rail scrolls, but only once it has to.
+                     *
+                     * There are ten destinations plus a header, about 620 dp of content, and the
+                     * rail is a plain Column that clips rather than scrolls. On a short window the
+                     * `weight(1f)` below collapses to zero and the last entries simply vanish off
+                     * the bottom: Listen Together was unreachable entirely, with Recognize jammed
+                     * against the MiniPlayer.
+                     *
+                     * The inner `heightIn(min = maxHeight)` is what keeps this from being a
+                     * regression on tall windows. It lets the column fill the rail exactly as
+                     * before, so `weight(1f)` still pins the tools group to the bottom, and only
+                     * when the content genuinely exceeds the available height does the outer
+                     * scroll engage. Scrolling unconditionally would have worked too, but a
+                     * `weight` child inside a scrollable column is meaningless, so the bottom
+                     * group would have drifted up on every screen to fix a fault only short ones
+                     * have.
+                     */
+                    BoxWithConstraints(Modifier.weight(1f)) {
+                        val available = maxHeight
+                        Column(Modifier.verticalScroll(rememberScrollState())) {
+                            Column(
+                                Modifier.fillMaxWidth().heightIn(min = available),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                    Spacer(Modifier.height(8.dp))
+
+                    @Composable
+                    fun ScreenButton(screen: Screen) {
+                        val selected = currentScreen == screen && detailStack.isEmpty()
+                        RailButton(if (selected) screen.selectedIcon else screen.icon, screen.title, selected) {
+                            currentScreen = screen
+                            detailStack.clear()
+                        }
+                    }
+
+                    // Content destinations on top; tools and Settings in the bottom group.
+                    Screen.entries.filter { it != Screen.Settings }.forEach { ScreenButton(it) }
+
+                    Spacer(Modifier.weight(1f))
+
+                    // Separates destinations above from tools below, which otherwise look identical.
+                    HorizontalDivider(Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+
+                    // One glyph shape each: Equalizer and Stats were both vertical bars.
+                    listOf(
+                        Triple(Icons.Outlined.Tune, "EQ", DetailScreen.Equalizer),
+                        Triple(Icons.Outlined.Insights, "Stats", DetailScreen.Stats),
+                        Triple(Icons.Outlined.Mic, "Identify", DetailScreen.Recognition),
+                        Triple(Icons.Outlined.Headphones, "Together", DetailScreen.ListenTogether),
+                    ).forEach { (icon, label, dest) ->
+                        RailButton(icon, label, detailStack.lastOrNull() == dest) {
+                            detailStack.clear()
+                            detailStack.add(dest)
+                        }
+                    }
+                    ScreenButton(Screen.Settings)
+
+                    // Signing in lives in one place: the account button in the rail header.
+
+                    Spacer(Modifier.height(16.dp))
+                            }
+                        }
+                    }
+                }
+
+                VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                // Main content. The playing cover tints the top of every screen and the player
+                // dock. Read in the draw phase only, so a track change redraws, never recomposes.
+                val artUrl by player.select { it.currentSong?.thumbnailUrl }
+                val artTint = rememberArtTint(artUrl)
+                val washAlpha = LocalWaveMusicExtras.current.artWashAlpha
+                Column(modifier = Modifier.fillMaxSize().drawBehind {
+                    val tint = artTint.value
+                    if (tint.alpha > 0f) drawRect(
+                        Brush.verticalGradient(
+                            0f to tint.copy(alpha = tint.alpha * washAlpha),
+                            1f to Color.Transparent,
+                            endY = 340.dp.toPx()
+                        ),
+                        size = size.copy(height = 340.dp.toPx())
+                    )
+                }) {
+                    BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                    val panelWidth = (maxWidth * 0.32f).coerceIn(280.dp, 420.dp)
+                    Row(Modifier.fillMaxSize()) {
+                        // Screen content
+                        Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                            val currentDetail = detailStack.lastOrNull()
+                            val toolBack: (() -> Unit)? = if (detailStack.size > 1) ::navigateBack else null
+                            stateHolder.SaveableStateProvider(detailKeys.lastOrNull() ?: "screen:${currentScreen.name}") {
+                            if (currentDetail != null) {
+                                when (currentDetail) {
+                                    is DetailScreen.Album -> AlbumScreen(
+                                        browseId = currentDetail.browseId,
+                                        player = player,
+                                        onBack = ::navigateBack,
+                                        onArtistClick = ::navigateToArtist,
+                                        onAlbumClick = ::navigateToAlbum
+                                    )
+                                    is DetailScreen.Artist -> ArtistScreen(
+                                        browseId = currentDetail.browseId,
+                                        player = player,
+                                        onBack = ::navigateBack,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist,
+                                        onSectionMore = { endpoint, title ->
+                                            // Top songs' "more" is a playlist; the rest are grids
+                                            if (endpoint.browseId.startsWith("VL")) navigateToPlaylist(endpoint.browseId.removePrefix("VL"))
+                                            else detailStack.add(DetailScreen.ArtistItems(endpoint.browseId, endpoint.params, title))
+                                        }
+                                    )
+                                    is DetailScreen.ArtistItems -> ArtistItemsScreen(
+                                        browseId = currentDetail.browseId,
+                                        params = currentDetail.params,
+                                        title = currentDetail.title,
+                                        player = player,
+                                        onBack = ::navigateBack,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist
+                                    )
+                                    is DetailScreen.Playlist -> PlaylistScreen(
+                                        playlistId = currentDetail.playlistId,
+                                        player = player,
+                                        onBack = ::navigateBack,
+                                        onArtistClick = ::navigateToArtist
+                                    )
+                                    is DetailScreen.LocalPlaylist -> LocalPlaylistScreen(
+                                        playlistId = currentDetail.playlistId,
+                                        player = player,
+                                        onBack = ::navigateBack
+                                    )
+                                    is DetailScreen.AutoPlaylist -> AutoPlaylistScreen(
+                                        type = currentDetail.type,
+                                        player = player,
+                                        onBack = ::navigateBack
+                                    )
+                                    is DetailScreen.Browse -> BrowseScreen(
+                                        browseId = currentDetail.browseId,
+                                        params = currentDetail.params,
+                                        title = currentDetail.title,
+                                        player = player,
+                                        onBack = ::navigateBack,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist
+                                    )
+                                    is DetailScreen.Podcast -> PodcastScreen(
+                                        podcastId = currentDetail.podcastId,
+                                        player = player,
+                                        onBack = ::navigateBack
+                                    )
+                                    // Tools opened from the rail are destinations, so no Back arrow;
+                                    // reached from somewhere deeper, Back returns there.
+                                    is DetailScreen.ListenTogether -> ListenTogetherScreen(
+                                        player = player,
+                                        onBack = toolBack
+                                    )
+                                    is DetailScreen.Recognition -> RecognitionScreen(
+                                        player = player,
+                                        onBack = toolBack
+                                    )
+                                    is DetailScreen.Equalizer -> EqualizerScreen(
+                                        player = player,
+                                        onBack = toolBack
+                                    )
+                                    is DetailScreen.Stats -> StatsScreen(
+                                        onBack = toolBack,
+                                        onArtistClick = ::navigateToArtist,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        player = player
+                                    )
+                                }
+                            } else {
+                                when (currentScreen) {
+                                    Screen.Home -> HomeScreen(
+                                        player = player,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist,
+                                        onPodcastClick = ::navigateToPodcast
+                                    )
+                                    Screen.Explore -> ExploreScreen(
+                                        player = player,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist,
+                                        onBrowseClick = { browseId, params, title ->
+                                            detailStack.add(DetailScreen.Browse(browseId, params, title))
+                                        }
+                                    )
+                                    Screen.Search -> SearchScreen(
+                                        player = player,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist,
+                                        onPodcastClick = ::navigateToPodcast
+                                    )
+                                    Screen.Library -> LibraryScreen(
+                                        player = player,
+                                        onAlbumClick = ::navigateToAlbum,
+                                        onArtistClick = ::navigateToArtist,
+                                        onPlaylistClick = ::navigateToPlaylist,
+                                        onLocalPlaylistClick = { id ->
+                                            detailStack.add(DetailScreen.LocalPlaylist(id))
+                                        },
+                                        onAutoPlaylistClick = { type ->
+                                            detailStack.add(DetailScreen.AutoPlaylist(type))
+                                        },
+                                        onSignIn = { currentAppScreen = AppScreen.Login }
+                                    )
+                                    Screen.Settings -> SettingsScreen(
+                                        onLoginClick = { currentAppScreen = AppScreen.Login },
+                                        onRerunSetup = { currentAppScreen = AppScreen.Onboarding },
+                                        scrollToSection = settingsScrollTarget,
+                                        onSectionScrolled = { settingsScrollTarget = null }
+                                    )
+                                }
+                            }
+                            }
+
+                            // Overlays the screen rather than sitting in the layout, so no screen
+                            // needs to know it exists. Hidden on Settings, which is where it goes.
+                            UpdateBadge(
+                                visible = !(currentScreen == Screen.Settings && detailStack.isEmpty()),
+                                onClick = {
+                                    detailStack.clear()
+                                    currentScreen = Screen.Settings
+                                    // Landing at the top of a long list is barely better than
+                                    // not navigating: the update controls are near the bottom
+                                    // and people were not finding them.
+                                    settingsScrollTarget = SETTINGS_SECTION_UPDATES
+                                },
+                                // Below the title row: at the top corner it sat exactly where
+                                // every screen keeps its title actions (Sync, view toggle).
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 64.dp, end = WaveMusicTokens.contentPadding)
+                            )
+
+                            // Playback failures used to be silent in the UI: the VLC error event
+                            // only flipped isPlaying, so a dead track just never played. The
+                            // banner shows what VLC actually reported (see DesktopPlayer's native
+                            // log capture), which is also what a bug report needs.
+                            if (playbackError != null) {
+                                PlaybackErrorBanner(
+                                    error = playbackError,
+                                    onDismiss = player::clearError,
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .padding(WaveMusicTokens.contentPadding)
+                                )
+                            }
+                        }
+
+                        // Right-side panel: lyrics or the queue, never both, and never a
+                        // full-window takeover, so the player dock stays usable beside it.
+                        LyricsPanel(
+                            player = player,
+                            visible = showLyricsPanel && !showQueueScreen,
+                            onDismiss = { showLyricsPanel = false },
+                            modifier = Modifier.width(panelWidth)
+                        )
+                        if (showQueueScreen) {
+                            VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            QueueScreen(
+                                player = player,
+                                onDismiss = { showQueueScreen = false },
+                                modifier = Modifier.width(panelWidth.coerceAtLeast(340.dp)).fillMaxHeight()
+                            )
+                        }
+                    }
+                    }
+
+                    MiniPlayer(
+                        player = player,
+                        modifier = Modifier.fillMaxWidth(),
+                        onQueueClick = { showQueueScreen = !showQueueScreen; if (showQueueScreen) showLyricsPanel = false },
+                        onLyricsClick = { showLyricsPanel = !showLyricsPanel; if (showLyricsPanel) showQueueScreen = false },
+                        lyricsActive = showLyricsPanel && !showQueueScreen,
+                        queueActive = showQueueScreen,
+                        artTint = artTint
+                    )
+                }
+
+                // Command palette overlay
+                CommandPalette(
+                    visible = showCommandPalette,
+                    player = player,
+                    onDismiss = { showCommandPalette = false },
+                    onNavigate = { action: PaletteAction ->
+                        when (action) {
+                            is PaletteAction.GoHome -> { currentScreen = Screen.Home; detailStack.clear() }
+                            is PaletteAction.GoSearch -> { currentScreen = Screen.Search; detailStack.clear() }
+                            is PaletteAction.GoLibrary -> { currentScreen = Screen.Library; detailStack.clear() }
+                            is PaletteAction.GoSettings -> { currentScreen = Screen.Settings; detailStack.clear() }
+                            is PaletteAction.GoEqualizer -> { detailStack.clear(); detailStack.add(DetailScreen.Equalizer) }
+                            is PaletteAction.GoStats -> { detailStack.clear(); detailStack.add(DetailScreen.Stats) }
+                            is PaletteAction.GoQueue -> { showQueueScreen = true; showLyricsPanel = false }
+                            is PaletteAction.GoLyrics -> { showLyricsPanel = !showLyricsPanel; if (showLyricsPanel) showQueueScreen = false }
+                            is PaletteAction.NextTrack -> scope.launch { player.playNext() }
+                            is PaletteAction.PrevTrack -> scope.launch { player.playPrevious() }
+                            is PaletteAction.PlaySong -> scope.launch { player.playSong(action.song) }
+                            else -> {} // PlayPause, Shuffle, Repeat handled in executeAction
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+/**
+ * One rail destination: icon over an always-visible label. Icon-only with hover tooltips left
+ * new users guessing. A filled pill behind the icon marks the current one; that is the whole
+ * indicator, no animation to pay for.
+ */
+@Composable
+private fun RailButton(icon: ImageVector, label: String, selected: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val fg = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant
+    Column(
+        Modifier
+            .padding(vertical = 2.dp)
+            .width(68.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(role = Role.Tab, onClickLabel = label, onClick = onClick)
+            .padding(vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            Modifier
+                .size(width = 52.dp, height = 32.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(if (selected) colors.primaryContainer else Color.Transparent),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = fg, modifier = Modifier.size(24.dp))
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (selected) colors.onSurface else colors.onSurfaceVariant,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun AccountButton(
+    isLoggedIn: Boolean,
+    accountName: String?,
+    avatarUrl: String?,
+    onClick: () -> Unit
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier.size(48.dp)
+    ) {
+        if (isLoggedIn && avatarUrl != null) {
+            AsyncImage(
+                model = avatarUrl,
+                contentDescription = accountName ?: "Account",
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+        } else if (isLoggedIn) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text(
+                        text = accountName?.firstOrNull()?.uppercase() ?: "?",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+            }
+        } else {
+            Icon(
+                Icons.Default.AccountCircle,
+                contentDescription = "Sign In",
+                modifier = Modifier.size(32.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Transient banner for playback failures. Auto-dismisses; a new error message restarts the
+ * timer because LaunchedEffect is keyed on the text.
+ */
+@Composable
+private fun PlaybackErrorBanner(
+    error: String?,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (error != null) {
+        LaunchedEffect(error) {
+            delay(8000)
+            onDismiss()
+        }
+        Surface(
+            color = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            shape = MaterialTheme.shapes.extraLarge,
+            modifier = modifier.widthIn(max = 640.dp)
+        ) {
+            Row(Modifier.padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.ErrorOutline, null, Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Text(error, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f, fill = false))
+                Tip("Dismiss") {
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Dismiss", Modifier.size(18.dp)) }
+                }
+            }
+        }
+    }
+}

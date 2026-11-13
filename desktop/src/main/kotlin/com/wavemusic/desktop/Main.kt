@@ -1,0 +1,601 @@
+package com.wavemusic.desktop
+
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.awt.ComposeWindow
+import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.WindowPosition
+import androidx.compose.ui.window.application
+import androidx.compose.ui.window.rememberWindowState
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
+import coil3.ImageLoader
+import coil3.SingletonImageLoader
+import coil3.disk.DiskCache
+import coil3.memory.MemoryCache
+import com.wavemusic.desktop.ui.components.AutoScroll
+import com.wavemusic.desktop.ui.components.FLOATING_PLAYER_WINDOW_DP
+import com.wavemusic.desktop.ui.components.FloatingPlayer
+import com.wavemusic.desktop.ui.components.floatingPlayerLocation
+import com.wavemusic.desktop.ui.components.TRAY_PANEL_HEIGHT
+import com.wavemusic.desktop.ui.components.TRAY_PANEL_WIDTH
+import com.wavemusic.desktop.ui.components.TrayPanel
+import com.wavemusic.desktop.auth.AuthManager
+import com.wavemusic.desktop.db.DatabaseHelper
+import com.wavemusic.desktop.media.MediaKeyHandler
+import com.wavemusic.desktop.settings.PreferencesManager
+import com.wavemusic.desktop.sync.LibrarySync
+import com.wavemusic.desktop.ui.App
+import com.wavemusic.desktop.update.AutoUpdater
+import com.wavemusic.desktop.ui.theme.WaveMusicTheme
+import com.wavemusic.desktop.playback.DesktopPlayer
+import com.wavemusic.desktop.integration.DiscordRPC
+import com.wavemusic.desktop.integration.LastFmManager
+import com.wavemusic.desktop.integration.WindowsAppIdentity
+import com.wavemusic.desktop.integration.WindowsStartMenuShortcut
+import com.wavemusic.desktop.integration.SystemMediaSession
+import com.wavemusic.desktop.notification.DesktopNotification
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import okio.Path.Companion.toPath
+import org.jetbrains.skia.Image
+import timber.log.Timber
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintStream
+import kotlin.system.exitProcess
+
+
+/**
+ * Give Coil a disk cache.
+ *
+ * Off Android, Coil enables no disk cache unless told to, so every thumbnail (home feed, album
+ * art, artist photos) was re-fetched from Google's CDN on every launch. A real install measured
+ * `data/cache` at 0 bytes for exactly that reason.
+ *
+ * It also gives the `cacheSize` preference something to govern. That setting was stored, saved
+ * and displayed under Settings → Storage while nothing anywhere read it: a 500 MB limit on an
+ * empty folder. Coil takes the same number as its eviction bound, so the two now agree.
+ *
+ * The memory cache is a fixed 64 MB rather than Coil's default percentage of max heap. The heap
+ * is capped in build.gradle.kts, and a fixed bound means changing that cap later cannot silently
+ * resize the image cache with it.
+ */
+private fun configureImageLoader() {
+    SingletonImageLoader.setSafe { context ->
+        ImageLoader.Builder(context)
+            .memoryCache {
+                MemoryCache.Builder().maxSizeBytes(64L * 1024 * 1024).build()
+            }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(PreferencesManager.getCacheDirectory().absolutePath.toPath())
+                    .maxSizeBytes(PreferencesManager.preferences.value.cacheSize)
+                    .build()
+            }
+            .build()
+    }
+}
+
+/**
+ * Opening size, clamped to what the screen can actually display.
+ *
+ * Compose dp map to Java user-space units, and Windows display scaling shrinks the usable desktop
+ * measured in those units. A 1080p screen offers 1920x1032 dp at 100%, but only 1536x826 at 125%
+ * and 1280x688 at 150%. The old fixed 1200x800 therefore opened a window 112 dp taller than the
+ * screen at 150%, cutting off the bottom of the app, which is where the player controls are. 125%
+ * is Windows' recommended setting on most 1080p laptops, so this was the common case rather than
+ * an edge case.
+ *
+ * `maximumWindowBounds` already excludes the taskbar. The 0.92 keeps a margin so the window still
+ * reads as a window instead of filling the screen edge to edge, and there is deliberately no lower
+ * bound: on a genuinely small display the screen is the constraint, and forcing a minimum would
+ * reintroduce the same off-screen problem it is meant to prevent.
+ */
+private fun defaultWindowSize(): DpSize {
+    val usable = try {
+        java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds
+    } catch (e: Exception) {
+        Timber.w("Could not read screen bounds, using fixed default: ${e.message}")
+        null
+    }
+    val w = usable?.width?.takeIf { it > 0 }?.let { minOf(1200, (it * 0.92).toInt()) } ?: 1200
+    val h = usable?.height?.takeIf { it > 0 }?.let { minOf(800, (it * 0.92).toInt()) } ?: 800
+    return DpSize(w.dp, h.dp)
+}
+
+
+
+
+/**
+ * Read a bundled PNG from the classpath, or null if it is missing or unreadable.
+ *
+ * Callers pick between "icon.png" for windows and "icon-small.png" for the tray and small
+ * taskbar sizes, where the simpler mark stays readable.
+ */
+private fun loadResourceImage(name: String): java.awt.image.BufferedImage? = try {
+    Thread.currentThread().contextClassLoader.getResourceAsStream(name)
+        ?.use { javax.imageio.ImageIO.read(it) }
+        ?: run { Timber.w("$name not found in classpath resources"); null }
+} catch (e: Exception) {
+    Timber.w("Failed to read $name: ${e.message}")
+    null
+}
+
+fun main(args: Array<String>) {
+    val log = installCrashReporting()
+    // Before any window or the media session exists: both are named by the process's app id.
+    WindowsAppIdentity.apply()
+    try {
+        if ("--headless" in args) com.wavemusic.desktop.headless.Headless.run(args) else runApp()
+    } catch (e: Throwable) {
+        reportFatal(e, log)
+        exitProcess(1)
+    }
+}
+
+private fun runApp() {
+    // Before the database opens: a second copy only wakes the first one up.
+    // A headless copy (the Steam Deck plugin's) quits when poked, so try once more after it has gone.
+    // A windowed copy just gets shown twice.
+    if (!SingleInstance.claim()) {
+        Thread.sleep(1500)
+        if (!SingleInstance.claim()) exitProcess(0)
+    }
+
+    // Every remaining Swing dialog (folder pickers, backup/restore) defaults to the
+    // cross-platform Metal look — grey 1990s widgets. The system L&F makes them render
+    // as native Windows dialogs instead. Must be set before any Swing class loads.
+    try {
+        javax.swing.UIManager.setLookAndFeel(javax.swing.UIManager.getSystemLookAndFeelClassName())
+    } catch (e: Exception) {
+        Timber.w("Could not apply system look and feel: ${e.message}")
+    }
+
+    // Load icon once at startup from classpath resources (512x512 PNG)
+    val appIcon = try {
+        val bytes = Thread.currentThread().contextClassLoader
+            .getResourceAsStream("icon.png")?.readBytes()
+        if (bytes != null) {
+            BitmapPainter(Image.makeFromEncoded(bytes).toComposeImageBitmap())
+        } else {
+            Timber.w("icon.png not found in classpath resources")
+            null
+        }
+    } catch (e: Exception) {
+        Timber.e("Failed to load app icon: ${e.message}")
+        null
+    }
+
+    // Initialize core services before window (fast, no I/O)
+    DatabaseHelper.initialize()
+    PreferencesManager.initialize()
+    configureImageLoader()
+    applyNetworkPreferences()
+    // Seeds the OS light/dark read here, before any window, instead of inside composition.
+    com.wavemusic.desktop.ui.theme.SystemTheme.isDark.value
+
+    // A Windows app folder the user cannot write (e.g. unzipped into Program Files) sends data to
+    // the working directory, which changes with how the app is launched. Say so rather than
+    // letting the library appear to vanish between launches.
+    if (AppPaths.appDirNotWritable) {
+        javax.swing.JOptionPane.showMessageDialog(
+            null,
+            "Wave Music can't write to its folder:\n${AppPaths.appDir}\n\n" +
+                "Settings and your library are being kept in\n${AppPaths.dataDir}\ninstead. " +
+                "Move Wave Music to a folder you own (e.g. Documents) to keep everything together.",
+            "Wvusic",
+            javax.swing.JOptionPane.WARNING_MESSAGE
+        )
+    }
+
+    // Sweep the login profile: cookie store and caches out, saved passwords in.
+    //
+    // The cookies in it were copied into credentials.json when it was created and are never
+    // read again, but nothing used to delete them, so a second live Google session sat next to
+    // the app that even signing out did not remove. A real install measured 87 MB, which was
+    // 99% of the entire data folder.
+    //
+    // Safe at startup specifically because no login can be in flight yet. Nobody is signed out
+    // by this: credentials.json is what the app authenticates with, and it is untouched.
+    com.wavemusic.desktop.auth.BrowserLoginHelper.pruneLoginProfile()
+
+    // Pick up downloads that did not finish before the last close. Rows still marked
+    // 'downloading' were interrupted mid-transfer, not failed, and their partial files are
+    // still on disk, so this resumes rather than starting the transfers over.
+    com.wavemusic.desktop.download.DownloadManager.restoreQueue()
+
+    application {
+        // Centred as well as clamped: a window sized to fit is still useless if the platform
+        // places it partly off-screen.
+        val windowState = rememberWindowState(
+            size = defaultWindowSize(),
+            position = WindowPosition(Alignment.Center)
+        )
+        val player = remember { DesktopPlayer() }
+        var windowVisible by remember { mutableStateOf(true) }
+        var trayPanelAt by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+        val trayPanelState = rememberWindowState(
+            width = TRAY_PANEL_WIDTH.dp,
+            height = TRAY_PANEL_HEIGHT.dp
+        )
+
+        // Keeps the floating player down while quitting: hiding the main window would otherwise
+        // bring it up for the length of the teardown
+        var quitting by remember { mutableStateOf(false) }
+
+        /**
+         * Quit, from every exit path (tray panel, window close, tray callback).
+         *
+         * The releases used to run on the UI thread and end in `exitApplication()`. Any one that
+         * blocked (VLC teardown, closing the Discord pipe while its reader is mid-read) froze the
+         * tray panel with Quit apparently doing nothing, and even a clean `exitApplication()`
+         * left the JVM running on VLC's non-daemon threads. So the windows go away at once, the
+         * releases run off the UI thread, and the process exits regardless after 3 s.
+         */
+        val quit: () -> Unit = {
+            quitting = true
+            trayPanelAt = null
+            windowVisible = false
+            kotlin.concurrent.thread(name = "shutdown") {
+                // ponytail: fixed 3 s watchdog, halt skips anything unfinished (queue is saved first in player.release)
+                kotlin.concurrent.thread(isDaemon = true) {
+                    Thread.sleep(3_000)
+                    Runtime.getRuntime().halt(0)
+                }
+                // Queue save lives in player.release, so it goes first.
+                listOf(
+                    player::release,
+                    DesktopNotification::release,
+                    LastFmManager::release,
+                    DiscordRPC::release,
+                    SystemMediaSession::release,
+                    MediaKeyHandler::release
+                ).forEach { runCatching { it() }.onFailure { e -> Timber.e("Release failed on quit: ${e.message}") } }
+                exitProcess(0)
+            }
+        }
+
+        // Initialize VLC, auth, media keys, queue restore, and integrations off the main thread
+        LaunchedEffect(player) {
+            withContext(Dispatchers.IO) {
+                player.ensureVlcInitialized()
+            }
+            // WinRT initializes in a multi-threaded COM apartment. Compose's UI thread may
+            // already be an AWT single-threaded apartment, so create the session off the UI thread.
+            val systemMediaSessionAvailable = withContext(Dispatchers.IO) {
+                // Keeps the Start Menu shortcut in step with the setting, and repoints it when the
+                // portable folder has moved. Without it Windows has no name for the app id.
+                WindowsStartMenuShortcut.apply(PreferencesManager.preferences.value.windowsMediaAppName)
+                SystemMediaSession.initialize(player)
+            }
+            MediaKeyHandler.initialize(player, handleHardwareMediaKeys = !systemMediaSessionAvailable)
+            // Auth needs network — run after window is visible
+            AuthManager.initialize()
+            // Restore queue (metadata only, no stream URL resolution)
+            player.restoreQueue()
+            player.setVolume(PreferencesManager.preferences.value.volume)
+            // Auto-sync library on each launch (no-op if not logged in or already syncing)
+            delay(1000) // brief delay so UI settles before network storm
+            if (PreferencesManager.preferences.value.autoSyncOnStartup) {
+                LibrarySync.syncLibrary()
+            }
+
+            /**
+             * Sync again whenever someone signs in.
+             *
+             * The launch sync above is a single shot, and on a first run it fires before there are
+             * any credentials, so it returns without syncing. The user then signs in, and
+             * nothing synced their library until the next restart: an empty app that looks broken.
+             * Onboarding made that the path every new user takes, but the gap was always there for
+             * anyone signing in from Settings.
+             *
+             * `drop(1)` skips the value StateFlow replays on subscribe, which is whatever
+             * `AuthManager.initialize()` just settled on and the launch sync has already handled.
+             * Only real transitions get here.
+             *
+             * Deliberately not gated on `autoSyncOnStartup`: that setting is about launch
+             * behaviour, and someone who just signed in has taken an explicit action and expects
+             * their library to appear. `syncLibrary()` already no-ops if one is in flight.
+             */
+            launch {
+                // Keyed on the account, not just on being signed in, so switching accounts
+                // resyncs too: that changes who is signed in without isLoggedIn ever changing.
+                AuthManager.authState
+                    .map { if (it.isLoggedIn) it.accountId else null }
+                    .distinctUntilChanged()
+                    .drop(1)
+                    .collect { accountId ->
+                        if (accountId != null) {
+                            Timber.i("Signed in, syncing library")
+                            LibrarySync.resync()
+                        }
+                    }
+            }
+            // Integrations
+            DiscordRPC.initialize(player)
+            LastFmManager.initialize(player)
+            DesktopNotification.initialize(player)
+
+            // Set up tray callbacks for minimize-to-tray
+            DesktopNotification.onShowWindow = {
+                windowVisible = true
+                windowState.isMinimized = false
+            }
+            // Launching again restores the window, the one way back if the tray icon is deaf.
+            SingleInstance.onActivate = {
+                java.awt.EventQueue.invokeLater { DesktopNotification.onShowWindow?.invoke() }
+            }
+            DesktopNotification.onTrayMenu = { clickX, clickY ->
+                val screen = java.awt.Toolkit.getDefaultToolkit().screenSize
+                // Anchor above-left of the cursor (the tray sits bottom-right), clamped on screen.
+                // Moved before it is shown, so it never flashes at the last spot.
+                val x = (clickX - TRAY_PANEL_WIDTH / 2).coerceIn(8, screen.width - TRAY_PANEL_WIDTH - 8)
+                val y = (clickY - TRAY_PANEL_HEIGHT - 16).coerceIn(8, screen.height - TRAY_PANEL_HEIGHT - 8)
+                trayPanelState.position = WindowPosition(x.dp, y.dp)
+                trayPanelAt = x to y
+            }
+            DesktopNotification.onExitApp = quit
+        }
+
+        val prefs by PreferencesManager.preferences.collectAsState()
+        // Only the current song matters here, so only that is collected. The full playback state
+        // carries a position that updates five times a second during playback, and subscribing to
+        // it re-ran this whole scope (the one holding the Window) at the same rate to recompute
+        // a title that changes once a track.
+        val currentSong by remember(player) {
+            player.state.map { it.currentSong }.distinctUntilChanged()
+        }.collectAsState(null)
+
+        val windowTitle = remember(currentSong) {
+            val song = currentSong
+            if (song != null) "♪ ${song.title} · ${song.artist} | Wvusic" else "Wvusic"
+        }
+
+        Window(
+            onCloseRequest = {
+                // Only hide when a tray icon exists to bring the window back; GNOME has none.
+                if (prefs.minimizeToTray && DesktopNotification.trayActive) {
+                    // Minimize to tray instead of exiting
+                    windowVisible = false
+                } else {
+                    quit()
+                }
+            },
+            visible = windowVisible,
+            title = windowTitle,
+            state = windowState,
+            icon = appIcon,
+            onPreviewKeyEvent = { com.wavemusic.desktop.ui.AppShortcuts.preview(it) },
+            onKeyEvent = { com.wavemusic.desktop.ui.AppShortcuts.bubble(it) },
+        ) {
+            // Middle-click autoscroll. Registered on the toolkit rather than the window so it
+            // fires wherever the pointer is inside the app — Compose consumes mouse events
+            // before they reach any listener on the window itself.
+            DisposableEffect(window) {
+                val listener = java.awt.event.AWTEventListener { event ->
+                    val e = event as? java.awt.event.MouseEvent ?: return@AWTEventListener
+                    if (e.id != java.awt.event.MouseEvent.MOUSE_PRESSED) return@AWTEventListener
+                    if (e.button == java.awt.event.MouseEvent.BUTTON2) {
+                        AutoScroll.toggle(e.xOnScreen, e.yOnScreen, window)
+                    } else if (AutoScroll.isActive) {
+                        AutoScroll.stop()
+                    }
+                }
+                java.awt.Toolkit.getDefaultToolkit()
+                    .addAWTEventListener(listener, java.awt.AWTEvent.MOUSE_EVENT_MASK)
+                onDispose {
+                    java.awt.Toolkit.getDefaultToolkit().removeAWTEventListener(listener)
+                    AutoScroll.stop()
+                }
+            }
+
+            /**
+             * Check for a new version shortly after launch, if the user wants that.
+             *
+             * Deliberately delayed rather than run at startup: the window paints at ~1.6s and
+             * VLC, auth and the queue all initialise off the main thread just after, so firing a
+             * network call into that window would trade startup time for something nobody is
+             * waiting on.
+             *
+             * The result is announced through the tray rather than a dialog. An update is not
+             * urgent, and a modal on launch is the kind of thing people learn to dismiss without
+             * reading. Settings shows the same state for anyone who goes looking.
+             */
+            LaunchedEffect(Unit) {
+                if (!PreferencesManager.preferences.value.checkUpdatesOnLaunch) return@LaunchedEffect
+                delay(10_000)
+                AutoUpdater.checkForUpdates()
+                // Wait for a settled state; Idle and Checking are both transient here.
+                val settled = AutoUpdater.updateState.first {
+                    it is AutoUpdater.UpdateState.UpdateAvailable ||
+                        it is AutoUpdater.UpdateState.UpToDate ||
+                        it is AutoUpdater.UpdateState.Error
+                }
+                when (settled) {
+                    is AutoUpdater.UpdateState.UpdateAvailable -> DesktopNotification.notify(
+                        "Wave Music ${settled.version} is available",
+                        "Open Settings to download and install it."
+                    )
+                    is AutoUpdater.UpdateState.Error ->
+                        Timber.i("Launch update check failed: ${settled.message}")
+                    else -> Timber.i("Launch update check: up to date")
+                }
+            }
+
+            // Set AWT icon images for taskbar/alt-tab (multiple sizes for best quality)
+            LaunchedEffect(Unit) {
+                try {
+                    // Two artworks, picked by size. The small mark keeps the tray glyph readable
+                    // once it is scaled down to 16-48 px.
+                    val full = loadResourceImage("icon.png")
+                    val small = loadResourceImage("icon-small.png") ?: full
+                    if (full != null) {
+                        val sizes = listOf(16, 24, 32, 48, 64, 128, 256)
+                        val scaledImages = sizes.map { size ->
+                            val source = if (size <= 48) small else full
+                            val scaled = java.awt.image.BufferedImage(size, size, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+                            val g2d = scaled.createGraphics()
+                            g2d.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION, java.awt.RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+                            g2d.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
+                            g2d.drawImage(source, 0, 0, size, size, null)
+                            g2d.dispose()
+                            scaled as java.awt.Image
+                        }
+                        window.iconImages = scaledImages
+                    }
+                } catch (e: Exception) {
+                    Timber.w("Failed to set AWT window icons: ${e.message}")
+                }
+            }
+
+            /**
+             * Floor on how small the window can be dragged.
+             *
+             * The MiniPlayer adapts at two breakpoints, moving less common actions into an
+             * overflow while keeping transport, queue, mute and a compact volume slider visible.
+             * The floor still protects the remaining title and artwork space at narrow widths.
+             *
+             * Clamped against the opening size so it can never exceed what the screen fits. On a
+             * small display the screen is still the constraint, and a minimum larger than the
+             * desktop would recreate the off-screen window this all exists to prevent.
+             */
+            LaunchedEffect(windowState.size) {
+                try {
+                    window.minimumSize = java.awt.Dimension(
+                        minOf(720, windowState.size.width.value.toInt()),
+                        minOf(520, windowState.size.height.value.toInt())
+                    )
+                } catch (e: Exception) {
+                    Timber.w("Could not set minimum window size: ${e.message}")
+                }
+            }
+
+            WaveMusicTheme(themeMode = prefs.themeMode) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    App(player = player)
+                }
+            }
+        }
+
+        // Floating mini player (issue #11): only while the main window is out of sight, since
+        // on top of Wave Music itself it would just cover the real player bar. Closing it hides it
+        // until the main window next comes back, rather than switching the setting off.
+        val mainHidden = !windowVisible || windowState.isMinimized
+        var floatingDismissed by remember { mutableStateOf(false) }
+        LaunchedEffect(mainHidden) { if (!mainHidden) floatingDismissed = false }
+        // The window exists for as long as the setting is on and is only shown and hidden after
+        // that. Creating it on demand took around four seconds to appear, most of it standing
+        // up a fresh render surface, which is long enough to look like it had not worked.
+        if (prefs.floatingPlayer) {
+            Window(
+                visible = currentSong != null && mainHidden && !floatingDismissed && !quitting,
+                create = {
+                    ComposeWindow().apply {
+                        // A utility window has no taskbar button. Without it a second Wave Music
+                        // appeared on the taskbar, including while the app was meant to be
+                        // tucked away in the tray. All of these must be set before the window is
+                        // first shown; AWT refuses most of them afterwards.
+                        type = java.awt.Window.Type.UTILITY
+                        isUndecorated = true
+                        isTransparent = true
+                        isAlwaysOnTop = true
+                        isResizable = false
+                        // Clicking the player must not pull focus away from whatever the user
+                        // is working in.
+                        focusableWindowState = false
+                        title = "Wvusic"
+                        setSize(FLOATING_PLAYER_WINDOW_DP, FLOATING_PLAYER_WINDOW_DP)
+                        location = floatingPlayerLocation(
+                            PreferencesManager.preferences.value.floatingPlayerX,
+                            PreferencesManager.preferences.value.floatingPlayerY
+                        )
+                        // Dragging moves the window dozens of times a second. Save once it
+                        // settles, not on every step.
+                        val save = javax.swing.Timer(500) {
+                            PreferencesManager.setFloatingPlayerPosition(location.x, location.y)
+                        }.apply { isRepeats = false }
+                        addComponentListener(object : java.awt.event.ComponentAdapter() {
+                            override fun componentMoved(e: java.awt.event.ComponentEvent?) = save.restart()
+                        })
+                    }
+                },
+                dispose = { it.dispose() }
+            ) {
+                WaveMusicTheme(themeMode = prefs.themeMode) {
+                    FloatingPlayer(
+                        player = player,
+                        onOpenMain = {
+                            windowVisible = true
+                            windowState.isMinimized = false
+                        },
+                        onClose = { floatingDismissed = true }
+                    )
+                }
+            }
+        }
+
+        // Tray popup — replaces AWT's unthemeable native PopupMenu.
+        // The window is created once and only shown/hidden: building a transparent window on
+        // every right-click took seconds, the same cost the floating player hit.
+        if (DesktopNotification.trayActive || trayPanelAt != null) {
+            Window(
+                onCloseRequest = { trayPanelAt = null },
+                state = trayPanelState,
+                visible = trayPanelAt != null,
+                undecorated = true,
+                transparent = true,
+                resizable = false,
+                alwaysOnTop = true,
+                focusable = true,
+                title = "Wvusic",
+                // Without this the popup gets Compose's default Java icon, which shows up in the
+                // taskbar as a stray coffee cup whenever the tray panel is opened.
+                icon = appIcon
+            ) {
+                // Dismiss when the user clicks elsewhere, the way a real menu behaves.
+                DisposableEffect(Unit) {
+                    val listener = object : java.awt.event.WindowAdapter() {
+                        override fun windowLostFocus(e: java.awt.event.WindowEvent?) {
+                            trayPanelAt = null
+                        }
+                    }
+                    window.addWindowFocusListener(listener)
+                    onDispose { window.removeWindowFocusListener(listener) }
+                }
+                LaunchedEffect(trayPanelAt) {
+                    if (trayPanelAt != null) {
+                        window.toFront()
+                        window.requestFocus()
+                    }
+                }
+
+                // Content only while open, so the hidden window does not recompose on every
+                // position tick.
+                if (trayPanelAt != null) WaveMusicTheme(themeMode = prefs.themeMode) {
+                    TrayPanel(
+                        player = player,
+                        onOpenWindow = { windowVisible = true },
+                        onQuit = quit,
+                        onDismiss = { trayPanelAt = null }
+                    )
+                }
+            }
+        }
+    }
+}
