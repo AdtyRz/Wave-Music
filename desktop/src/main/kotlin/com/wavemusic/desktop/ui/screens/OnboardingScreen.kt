@@ -1,6 +1,7 @@
 package com.wavemusic.desktop.ui.screens
 
 import com.wavemusic.desktop.ui.theme.selectedChipColors
+import com.wavemusic.desktop.ui.components.BrowserChooser
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -271,7 +272,9 @@ private fun SignInStep() {
     var status by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
-    val browser = remember { BrowserLoginHelper.findLoginBrowser() }
+    val browsers = remember { BrowserLoginHelper.findAllLoginBrowsers() }
+    var selectedBrowser by remember { mutableStateOf(browsers.firstOrNull()) }
+    val browser = selectedBrowser
     val browserName = browser?.name ?: "your browser"
 
     fun handle(result: CookieExtractResult) {
@@ -299,7 +302,7 @@ private fun SignInStep() {
         phase = SignInPhase.WAITING
         status = "Opening $browserName..."
         error = null
-        scope.launch { handle(BrowserLoginHelper.loginWithBrowser { status = it }) }
+        scope.launch { handle(BrowserLoginHelper.loginWithBrowser(selectedBrowser) { status = it }) }
     }
 
     StepHeading(
@@ -415,6 +418,13 @@ private fun SignInStep() {
                 }
                 Spacer(Modifier.height(16.dp))
             }
+
+            BrowserChooser(
+                browsers = browsers,
+                selected = selectedBrowser,
+                onSelect = { selectedBrowser = it },
+            )
+            Spacer(Modifier.height(8.dp))
 
             if (browser == null) {
                 Text(
