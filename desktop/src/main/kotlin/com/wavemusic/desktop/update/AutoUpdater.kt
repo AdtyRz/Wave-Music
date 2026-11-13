@@ -37,26 +37,34 @@ object AutoUpdater {
         ?: error("version.properties missing from the build")
 
     /**
-     * Windows replaces itself. On Linux the install belongs to the package manager under a
-     * root-owned /opt, so an update downloads the signed .rpm/.deb and hands it to dnf/apt through
-     * pkexec. Anything else on Linux (a dev run, an unpacked tree) only points at the release page.
+     * Windows replaces itself. A package-managed Linux install downloads the signed .rpm/.deb
+     * and hands it to the package manager through pkexec; a user-writable install (such as
+     * ~/.local/opt/wvusic) swaps its own directory from the release tarball. A read-only or
+     * dev copy only points at the release page.
      */
-    val canSelfUpdate: Boolean get() = Platform.isWindows || linuxPackage != null
+    val canSelfUpdate: Boolean get() = Platform.isWindows || linuxPackage != null || linuxPortable
+    val requiresPackageManager: Boolean get() = linuxPackage != null
 
-    /** "rpm" or "deb" when this copy is the one the wavemusic package installed in /opt, else null. */
+    /** "rpm" or "deb" when this copy is the one the wvusic package installed in /opt, else null. */
     private val linuxPackage: String? by lazy {
         if (!Platform.isLinux) return@lazy null
         val jar = runCatching { AutoUpdater::class.java.protectionDomain.codeSource.location.path }.getOrNull()
-        if (jar?.startsWith("/opt/wavemusic/") != true) return@lazy null
+        if (jar?.startsWith("/opt/wvusic/") != true) return@lazy null
         fun owns(vararg cmd: String) = runCatching {
             ProcessBuilder(*cmd).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .start().waitFor() == 0
         }.getOrDefault(false)
         when {
-            owns("rpm", "-q", "wavemusic") -> "rpm"
-            owns("dpkg-query", "-W", "wavemusic") -> "deb"
+            owns("rpm", "-q", "wvusic") -> "rpm"
+            owns("dpkg-query", "-W", "wvusic") -> "deb"
             else -> null
         }
+    }
+
+    /** A user-writable Linux install (e.g. ~/.local/opt/wvusic) can replace itself. */
+    private val linuxPortable: Boolean by lazy {
+        if (!Platform.isLinux || linuxPackage != null) return@lazy false
+        findAppDirectory()?.let { it.canWrite() && File(it, "bin/Wvusic").exists() } == true
     }
 
     /**
@@ -68,13 +76,14 @@ object AutoUpdater {
      * While this is blank, updates install unverified as before (and say so in the log). Once set,
      * a release without a valid `<zip>.sig` asset is refused.
      */
-    internal const val UPDATE_PUBLIC_KEY = "MCowBQYDK2VwAyEASjXI0QXvXSkBn+Op+cHe3fFDxdSS2yRcFfCOoQdCXzI="
+    internal const val UPDATE_PUBLIC_KEY = "MCowBQYDK2VwAyEAO/Mj6HSdZ0QXebmmO/gXuvb+QYnll0E/Xy5aF7wSI/4="
     private const val GITHUB_OWNER = "AdtyRz"
     private const val GITHUB_REPO = "Wave-Music"
 
-    /** Launcher filename. Installs older than 2.9.4 are not carried forward: see AppPaths. */
-    private val LAUNCHER_NAMES = listOf("Wvusic.exe")
-    private const val API_URL = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest"
+    /** Launcher path inside the app directory, per platform. */
+    private val LAUNCHER_NAMES = if (Platform.isWindows) listOf("Wvusic.exe") else listOf("bin/Wvusic")
+    private val TAG_PREFIX = if (Platform.isWindows) "windows-v" else "linux-v"
+    private const val API_URL = "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases"
 
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -121,10 +130,7 @@ object AutoUpdater {
     // ==================== Public API ====================
 
     fun checkForUpdates() {
-        // Desktop builds are published per platform branch and do not use an upstream
-        // update feed. Until Wave Music has its own signed release channel, report the
-        // installed version as current instead of contacting one.
-        _state.value = UpdateState.UpToDate
+        checkForUpdatesFromGitHub()
     }
 
     private fun checkForUpdatesFromGitHub() {
@@ -141,7 +147,7 @@ object AutoUpdater {
                     return@launch
                 }
 
-                val latestVersion = release.tag_name.removePrefix("v")
+                val latestVersion = release.tag_name.removePrefix(TAG_PREFIX)
                 Timber.i("Update check: current=$CURRENT_VERSION, latest=$latestVersion")
 
                 if (!isNewerVersion(latestVersion, CURRENT_VERSION)) {
@@ -161,24 +167,29 @@ object AutoUpdater {
                     return@launch
                 }
 
-                val portable = Platform.isWindows && isPortableInstall()
+                val portable = isPortableInstall()
                 Timber.i("Install mode: ${linuxPackage ?: if (portable) "portable" else "installed"}")
 
-                val asset = if (linuxPackage != null) {
-                    release.assets.find { it.name.endsWith(".$linuxPackage") }
-                } else if (portable) {
-                    // Portable: need the ZIP
-                    release.assets.find {
+                val asset = when {
+                    linuxPackage != null -> release.assets.find { it.name.endsWith(".$linuxPackage") }
+                    // Linux portable installs replace their own directory from a tarball.
+                    Platform.isLinux -> release.assets.find {
+                        it.name.endsWith(".tar.gz") && it.name.contains("linux", ignoreCase = true)
+                    }
+                    portable -> release.assets.find {
                         it.name.contains("portable", ignoreCase = true) && it.name.endsWith(".zip")
                     }
-                } else {
-                    // Installed: prefer EXE installer, fall back to MSI
-                    release.assets.find { it.name.endsWith(".exe", ignoreCase = true) }
+                    else -> release.assets.find { it.name.endsWith(".exe", ignoreCase = true) }
                         ?: release.assets.find { it.name.endsWith(".msi", ignoreCase = true) }
                 }
 
                 if (asset == null) {
-                    val kind = linuxPackage?.let { ".$it package" } ?: if (portable) "portable ZIP" else "installer"
+                    val kind = when {
+                        linuxPackage != null -> ".$linuxPackage package"
+                        Platform.isLinux -> "Linux tarball"
+                        portable -> "portable ZIP"
+                        else -> "installer"
+                    }
                     Timber.w("No $kind in release assets: ${release.assets.map { it.name }}")
                     _state.value = UpdateState.Error("No $kind found for v$latestVersion")
                     return@launch
@@ -231,7 +242,7 @@ object AutoUpdater {
                 }
 
                 if (current.isPortable) {
-                    // Extract ZIP to a fresh temp staging dir to avoid leftover locked files
+                    // Extract to a fresh staging dir; the old files stay untouched until the swap.
                     val stagingDir = File(updateDir, "staging-${System.currentTimeMillis()}")
                     // Clean up any old staging dirs
                     updateDir.listFiles()?.filter { it.name.startsWith("staging") }?.forEach { old ->
@@ -240,23 +251,24 @@ object AutoUpdater {
                     Files.createDirectories(stagingDir.toPath())
 
                     Timber.i("Extracting to ${stagingDir.absolutePath}")
-                    extractZip(downloadFile, stagingDir)
+                    if (current.downloadUrl.endsWith(".tar.gz")) {
+                        extractTarGz(downloadFile, stagingDir)
+                    } else {
+                        extractZip(downloadFile, stagingDir)
+                    }
                     downloadFile.delete()
 
-                    // If ZIP has a single top-level directory, use that
+                    // Both release archives wrap everything in one top-level "Wvusic" directory.
                     val contents = stagingDir.listFiles() ?: emptyArray()
                     val sourceDir = if (contents.size == 1 && contents[0].isDirectory) {
-                        Timber.i("ZIP root dir: ${contents[0].name}")
+                        Timber.i("Archive root dir: ${contents[0].name}")
                         contents[0]
                     } else {
                         stagingDir
                     }
 
-                    // Verify we have the exe
-                    val hasExe = sourceDir.listFiles()?.any { f ->
-                        LAUNCHER_NAMES.any { f.name.equals(it, ignoreCase = true) }
-                    } == true
-                    if (!hasExe) {
+                    val hasLauncher = LAUNCHER_NAMES.any { File(sourceDir, it).exists() }
+                    if (!hasLauncher) {
                         Timber.e("No launcher in: ${sourceDir.listFiles()?.map { it.name }}")
                         _state.value = UpdateState.Error("Invalid update package, no ${LAUNCHER_NAMES.first()} found")
                         return@launch
@@ -333,6 +345,8 @@ object AutoUpdater {
         try {
             if (linuxPackage != null) {
                 applyLinuxPackageUpdate(current)
+            } else if (Platform.isLinux && current.isPortable) {
+                applyLinuxPortableUpdate(current)
             } else if (current.isPortable) {
                 applyPortableUpdate(current)
             } else {
@@ -393,7 +407,7 @@ object AutoUpdater {
                 state.updateFile.delete()
                 val pid = ProcessHandle.current().pid()
                 // Output goes nowhere: a pipe back to this JVM would SIGPIPE the new copy once we exit.
-                ProcessBuilder("sh", "-c", "while kill -0 $pid 2>/dev/null; do sleep 0.3; done; exec /usr/bin/wavemusic")
+                ProcessBuilder("sh", "-c", "while kill -0 $pid 2>/dev/null; do sleep 0.3; done; exec /usr/bin/wvusic")
                     .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
@@ -406,6 +420,83 @@ object AutoUpdater {
             }
         }
     }
+
+    /**
+     * User-local Linux installs (no root-owned package) swap their own directory after the app
+     * exits. The new tree is copied first, so a failed copy leaves the old install untouched.
+     */
+    private fun applyLinuxPortableUpdate(state: UpdateState.ReadyToInstall) {
+        val sourceDir = state.updateFile
+        val appDir = findAppDirectory()
+        if (appDir == null) {
+            _state.value = UpdateState.Error("Cannot determine app directory")
+            return
+        }
+
+        val updateDir = getUpdateDirectory()
+        Files.createDirectories(updateDir.toPath())
+        val scriptFile = File(updateDir, "wvusic-update.sh")
+        scriptFile.writeText(
+            buildLinuxPortableUpdateScript(
+                pid = ProcessHandle.current().pid(),
+                sourcePath = sourceDir.absolutePath,
+                destPath = appDir.absolutePath,
+                stagingPath = sourceDir.parentFile?.absolutePath ?: sourceDir.absolutePath,
+                logPath = File(updateDir, "update.log").absolutePath
+            )
+        )
+        scriptFile.setExecutable(true, true)
+
+        Timber.i("Portable Linux update: ${sourceDir.absolutePath} -> ${appDir.absolutePath}")
+        ProcessBuilder("/bin/sh", scriptFile.absolutePath)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+
+        Runtime.getRuntime().exit(0)
+    }
+
+    private fun shQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
+
+    private fun buildLinuxPortableUpdateScript(
+        pid: Long,
+        sourcePath: String,
+        destPath: String,
+        stagingPath: String,
+        logPath: String
+    ): String = """
+        #!/bin/sh
+        # Written by the Wvusic updater. Copies the new tree, swaps it in, and restarts.
+        exec >>${shQuote(logPath)} 2>&1
+        echo "=== Wvusic portable update ${'$'}(date) ==="
+        while kill -0 $pid 2>/dev/null; do sleep 0.3; done
+        sleep 1
+        DEST=${shQuote(destPath)}
+        SOURCE=${shQuote(sourcePath)}
+        NEW="${'$'}DEST.new.${'$'}${'$'}"
+        OLD="${'$'}DEST.old.${'$'}${'$'}"
+        rm -rf "${'$'}NEW"
+        if cp -a "${'$'}SOURCE" "${'$'}NEW"; then
+            if mv "${'$'}DEST" "${'$'}OLD"; then
+                if mv "${'$'}NEW" "${'$'}DEST"; then
+                    rm -rf "${'$'}OLD"
+                    rm -rf ${shQuote(stagingPath)}
+                    echo "Update installed"
+                else
+                    mv "${'$'}OLD" "${'$'}DEST"
+                    echo "ERROR: could not move the new tree into place"
+                fi
+            else
+                rm -rf "${'$'}NEW"
+                echo "ERROR: could not move the old install aside"
+            fi
+        else
+            rm -rf "${'$'}NEW"
+            echo "ERROR: could not copy the update"
+        fi
+        exec "${'$'}DEST/bin/Wvusic"
+    """.trimIndent()
 
     private fun applyPortableUpdate(state: UpdateState.ReadyToInstall) {
         val sourceDir = state.updateFile
@@ -520,14 +611,23 @@ object AutoUpdater {
      * portable copies living there hunting for an .exe/.msi asset: "No installer found".
      */
     private fun isPortableInstall(): Boolean {
+        if (Platform.isLinux) {
+            if (linuxPackage != null) return false
+            val appDir = findAppDirectory() ?: return true
+            return appDir.canWrite()
+        }
         val appDir = findAppDirectory() ?: return true // default to portable if unknown
         return !File(appDir, "unins000.exe").exists()
     }
 
     // ==================== Network ====================
 
+    /**
+     * Releases are published per platform (`android-v1.0.0`, `windows-v1.1.0`, `linux-v1.2.0`)
+     * so each app can move at its own version. Fetch the list and pick this platform's newest.
+     */
     private fun fetchLatestRelease(): GitHubRelease? {
-        val connection = URI(API_URL).toURL().openConnection() as HttpURLConnection
+        val connection = URI("$API_URL?per_page=30").toURL().openConnection() as HttpURLConnection
         connection.setRequestProperty("Accept", "application/vnd.github.v3+json")
         connection.setRequestProperty("User-Agent", "Wvusic/$CURRENT_VERSION")
         connection.connectTimeout = 10_000
@@ -536,7 +636,10 @@ object AutoUpdater {
         return try {
             if (connection.responseCode == 200) {
                 val body = connection.inputStream.bufferedReader().readText()
-                json.decodeFromString<GitHubRelease>(body)
+                json.decodeFromString<List<GitHubRelease>>(body)
+                    .firstOrNull {
+                        !it.draft && !it.prerelease && it.tag_name.startsWith(TAG_PREFIX)
+                    }
             } else {
                 val error = try { connection.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
                 Timber.w("GitHub API HTTP ${connection.responseCode}: $error")
@@ -664,6 +767,19 @@ object AutoUpdater {
         Timber.i("Extracted $count files to ${targetDir.absolutePath}")
     }
 
+    /** Linux releases ship a .tar.gz, and GNU tar is always present there. */
+    private fun extractTarGz(archive: File, targetDir: File) {
+        Files.createDirectories(targetDir.toPath())
+        val process = ProcessBuilder(
+            "tar", "-xzf", archive.absolutePath,
+            "-C", targetDir.absolutePath, "--no-same-owner"
+        ).redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        val code = process.waitFor()
+        if (code != 0) throw Exception("Cannot extract update (tar exit $code): ${output.takeLast(300)}")
+        Timber.i("Extracted ${archive.name} to ${targetDir.absolutePath}")
+    }
+
     // ==================== Helpers ====================
 
     internal fun isNewerVersion(latest: String, current: String): Boolean {
@@ -727,11 +843,19 @@ object AutoUpdater {
         } catch (_: Exception) {}
 
         // Strategy 4: common install locations
-        listOfNotNull(
-            System.getenv("LOCALAPPDATA")?.let { File(it, "Wvusic") },
-            File("C:/Program Files/Wvusic"),
-            File("C:/Program Files (x86)/Wvusic")
-        ).forEach { dir ->
+        val common = if (Platform.isLinux) {
+            listOf(
+                File(System.getProperty("user.home"), ".local/opt/wvusic"),
+                File("/opt/wvusic")
+            )
+        } else {
+            listOfNotNull(
+                System.getenv("LOCALAPPDATA")?.let { File(it, "Wvusic") },
+                File("C:/Program Files/Wvusic"),
+                File("C:/Program Files (x86)/Wvusic")
+            )
+        }
+        common.forEach { dir ->
             if (LAUNCHER_NAMES.any { File(dir, it).exists() }) return dir
         }
 

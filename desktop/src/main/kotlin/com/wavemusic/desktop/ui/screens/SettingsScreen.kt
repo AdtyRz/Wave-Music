@@ -1364,7 +1364,7 @@ fun SettingsScreen(
                                             style = MaterialTheme.typography.titleSmall
                                         )
                                         Text(
-                                            if (com.wavemusic.desktop.Platform.isLinux) "Asks for your password, then restarts the app"
+                                            if (AutoUpdater.requiresPackageManager) "Asks for your password, then restarts the app"
                                             else "The app will restart to apply the update",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
