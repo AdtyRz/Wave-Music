@@ -2,7 +2,7 @@
 
 <img src="desktop/src/main/resources/icon.png" width="112" alt="Wvusic logo">
 
-# Wave Music (Wvusic) 1.1.0 for Windows
+# Wave Music (Wvusic) 1.1.1 for Windows
 
 **A free, open-source YouTube Music player for Windows 10 and 11.**
 
@@ -22,31 +22,36 @@ This branch publishes the Windows desktop build. The other platforms live on the
 | Branch | Platform | Version |
 | --- | --- | --- |
 | `android` | Android | 1.0.0 |
-| `windows` | Windows 10/11 (portable ZIP) | **1.1.0** (this branch) |
-| `linux` | Linux x86_64 (`.deb`, `.rpm`, tarball) | 1.2.0 |
+| `windows` | Windows 10/11 (portable ZIP) | **1.1.1** (this branch) |
+| `linux` | Linux x86_64 (`.deb`, `.rpm`, tarball) | 1.2.1 |
+
+## System requirements
+
+- Windows 10 64-bit (version 1809 or newer) or Windows 11
+- 64-bit x86 processor; ARM64 is not supported yet
+- 4 GB RAM minimum, 8 GB recommended
+- About 600 MB free disk space (the unpacked folder is about 410 MB), plus
+  room for downloads and cache
+- 1280×720 display or larger
+- VLC and ffmpeg are bundled; no separate install is needed
 
 ## Build
 
-Requirements: JDK 21. Linux playback needs VLC from your distribution.
+Requirements: JDK 21 and a Windows x64 host. The portable ZIP bundles its own
+runtime, VLC and ffmpeg, so the target machine needs no Java install.
 
 ```bash
 # Run from source
 ./gradlew :desktop:run
 
-# Windows portable ZIP (on Windows)
+# Windows portable ZIP
 ./gradlew :desktop:packagePortableZip
-
-# Linux distributable and packages
-./gradlew :desktop:createDistributable
-nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/
-nfpm package -f packaging/linux/nfpm.yaml -p rpm -t dist/
 ```
 
 ## Data location
 
 - Windows portable: everything stays inside the app folder.
-- Linux: `~/.local/share/wavemusic`, downloads in `~/Music/Wave Music` by
-  default.
+- Downloads default to the `Downloads` folder inside the app folder.
 
 ## License
 
