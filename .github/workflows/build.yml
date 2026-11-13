@@ -1,0 +1,47 @@
+name: linux
+
+on:
+  push:
+    branches: [linux]
+  pull_request:
+    branches: [linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build distributable
+        run: ./gradlew :desktop:createDistributable
+
+      - name: Install nfpm
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update
+          sudo apt-get install -y nfpm
+
+      - name: Package .deb, .rpm and tarball
+        run: |
+          V=$(grep -oP 'val wavemusicVersion = "\K[^"]+' desktop/build.gradle.kts)
+          export WAVEMUSIC_VERSION="$V"
+          mkdir -p dist
+          nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/linux/nfpm.yaml -p rpm -t dist/
+          tar -C desktop/build/compose/binaries/main/app -czf "dist/wvusic-$V-linux-x86_64.tar.gz" Wvusic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wvusic-linux
+          path: dist/
