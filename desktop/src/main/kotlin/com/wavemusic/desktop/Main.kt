@@ -1,8 +1,19 @@
 package com.wavemusic.desktop
 
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.painter.BitmapPainter
@@ -410,13 +421,12 @@ private fun runApp() {
              * network call into that window would trade startup time for something nobody is
              * waiting on.
              *
-             * The result is announced through the tray rather than a dialog. An update is not
-             * urgent, and a modal on launch is the kind of thing people learn to dismiss without
-             * reading. Settings shows the same state for anyone who goes looking.
+             * The prompt appears shortly after the first frame, not while VLC and auth are still
+             * starting. The tray notification is kept as a fallback for anyone who dismisses it.
              */
             LaunchedEffect(Unit) {
                 if (!PreferencesManager.preferences.value.checkUpdatesOnLaunch) return@LaunchedEffect
-                delay(10_000)
+                delay(4_000)
                 AutoUpdater.checkForUpdates()
                 // Wait for a settled state; Idle and Checking are both transient here.
                 val settled = AutoUpdater.updateState.first {
@@ -427,7 +437,7 @@ private fun runApp() {
                 when (settled) {
                     is AutoUpdater.UpdateState.UpdateAvailable -> DesktopNotification.notify(
                         "Wave Music ${settled.version} is available",
-                        "Open Settings to download and install it."
+                        "Open the update prompt to install it."
                     )
                     is AutoUpdater.UpdateState.Error ->
                         Timber.i("Launch update check failed: ${settled.message}")
@@ -490,6 +500,7 @@ private fun runApp() {
                 ) {
                     App(player = player)
                 }
+                UpdatePrompt()
             }
         }
 
@@ -597,5 +608,108 @@ private fun runApp() {
                 }
             }
         }
+    }
+}
+
+/**
+ * One clear prompt when a release is newer: the launch check is useless if its only trace is a
+ * tray toast. "Later" dismisses this version for the session; the badge and Settings keep the
+ * update reachable.
+ */
+@Composable
+private fun UpdatePrompt() {
+    val state by AutoUpdater.updateState.collectAsState()
+    var dismissedVersion by remember { mutableStateOf<String?>(null) }
+
+    when (val current = state) {
+        is AutoUpdater.UpdateState.UpdateAvailable -> {
+            if (dismissedVersion != current.version) {
+                AlertDialog(
+                    onDismissRequest = { dismissedVersion = current.version },
+                    icon = { Icon(Icons.Default.SystemUpdate, contentDescription = null) },
+                    title = { Text("Wave Music ${current.version} is available") },
+                    text = {
+                        Column {
+                            Text(
+                                "You are on ${AutoUpdater.CURRENT_VERSION}. " +
+                                    if (AutoUpdater.requiresPackageManager) {
+                                        "The package manager will ask for your password, then the app restarts."
+                                    } else {
+                                        "The app will download the update and restart when you confirm."
+                                    },
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            val notes = current.releaseNotes?.trim().orEmpty()
+                            if (notes.isNotEmpty()) {
+                                Spacer(Modifier.height(12.dp))
+                                Text(
+                                    notes.take(600) + if (notes.length > 600) "…" else "",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        if (AutoUpdater.canSelfUpdate) {
+                            TextButton(onClick = { AutoUpdater.downloadAndInstall() }) {
+                                Text("Update now")
+                            }
+                        } else if (current.releaseUrl != null) {
+                            TextButton(onClick = {
+                                com.wavemusic.desktop.Platform.open(current.releaseUrl)
+                            }) {
+                                Text("Open release page")
+                            }
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { dismissedVersion = current.version }) {
+                            Text("Later")
+                        }
+                    }
+                )
+            }
+        }
+
+        is AutoUpdater.UpdateState.Downloading -> {
+            AlertDialog(
+                onDismissRequest = {},
+                icon = { Icon(Icons.Default.SystemUpdate, contentDescription = null) },
+                title = { Text("Downloading ${current.version}…") },
+                text = {
+                    Column {
+                        LinearProgressIndicator(
+                            progress = { current.progress },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text("${(current.progress * 100).toInt()}%")
+                    }
+                },
+                confirmButton = {}
+            )
+        }
+
+        is AutoUpdater.UpdateState.ReadyToInstall -> {
+            AlertDialog(
+                onDismissRequest = { AutoUpdater.dismiss() },
+                icon = { Icon(Icons.Default.SystemUpdate, contentDescription = null) },
+                title = { Text("${current.version} is ready") },
+                text = { Text("Restart Wave Music to finish installing the update.") },
+                confirmButton = {
+                    TextButton(onClick = { AutoUpdater.applyUpdate() }) {
+                        Text("Restart & Update")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { AutoUpdater.dismiss() }) {
+                        Text("Later")
+                    }
+                }
+            )
+        }
+
+        else -> Unit
     }
 }
